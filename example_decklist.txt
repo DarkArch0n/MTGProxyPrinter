@@ -2,8 +2,8 @@
 # Lines starting with # are comments
 # Format: [quantity]x Card Name or just Card Name
 
-4x Lightning Bolt
-4x Counterspell
+4x The One Ring
+4x Demonic Tutor
 2x Swords to Plowshares
 1x Sol Ring
 1x Command Tower
