@@ -33,8 +33,12 @@ CARDS_PER_PAGE = CARDS_PER_ROW * CARDS_PER_COL
 PREVIEW_CARD_WIDTH = 120
 PREVIEW_CARD_HEIGHT = int(PREVIEW_CARD_WIDTH * (CARD_HEIGHT_INCHES / CARD_WIDTH_INCHES))
 
-# Cache directory
-CACHE_DIR = Path(__file__).parent / "cache"
+# Cache directory - works both as script and as frozen exe
+if getattr(sys, 'frozen', False):
+    BASE_DIR = Path(sys.executable).parent
+else:
+    BASE_DIR = Path(__file__).parent
+CACHE_DIR = BASE_DIR / "cache"
 
 
 def setup_cache():
