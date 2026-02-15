@@ -18,6 +18,11 @@ env/
 cache/
 *.pdf
 
+# PyInstaller
+build/
+dist/
+*.spec
+
 # OS
 .DS_Store
 Thumbs.db
