@@ -51,12 +51,42 @@ def sanitize_filename(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*]', '_', name.lower().replace(' ', '_'))
 
 
-def parse_card_entry(entry: str) -> Tuple[Optional[str], int]:
-    """Parse a card entry like '4x Lightning Bolt' into (name, quantity)."""
+# Moxfield section headers to skip
+MOXFIELD_SECTIONS = {
+    'deck', 'sideboard', 'commander', 'companions', 'maybeboard',
+    'mainboard', 'considering', 'acquired',
+}
+
+
+def parse_card_entry(entry: str) -> Tuple[Optional[str], int, Optional[str], Optional[str]]:
+    """Parse a card entry into (name, quantity, set_code, collector_number).
+    
+    Supports formats:
+      - Simple:    4x Lightning Bolt
+      - Moxfield:  1 Lightning Bolt (2X2) 117
+      - Moxfield:  1 Lightning Bolt (2X2) 117 *F*
+    """
     entry = entry.strip()
     if not entry or entry.startswith('#'):
-        return None, 0
+        return None, 0, None, None
     
+    # Skip Moxfield section headers like "Deck", "Sideboard", etc.
+    if entry.lower().rstrip(':') in MOXFIELD_SECTIONS:
+        return None, 0, None, None
+    
+    # Try Moxfield format: qty Card Name (SET) CollectorNum [*F*]
+    mox_match = re.match(
+        r'^(\d+)x?\s+(.+?)\s+\(([A-Za-z0-9]+)\)\s+(\S+)(?:\s+\*[A-Z]+\*)?\s*$',
+        entry, re.IGNORECASE
+    )
+    if mox_match:
+        quantity = int(mox_match.group(1))
+        name = mox_match.group(2).strip()
+        set_code = mox_match.group(3).strip().lower()
+        collector_num = mox_match.group(4).strip()
+        return name, quantity, set_code, collector_num
+    
+    # Simple format: qty[x] Card Name
     match = re.match(r'^(\d+)x?\s+(.+)$', entry, re.IGNORECASE)
     if match:
         quantity = int(match.group(1))
@@ -65,16 +95,53 @@ def parse_card_entry(entry: str) -> Tuple[Optional[str], int]:
         quantity = 1
         name = entry
     
-    return name, quantity
+    return name, quantity, None, None
+
+
+def parse_moxfield_csv(content: str) -> List[Tuple[str, int, Optional[str], Optional[str]]]:
+    """Parse a Moxfield CSV export into card entries."""
+    import csv
+    from io import StringIO
+    
+    cards = []
+    reader = csv.DictReader(StringIO(content))
+    
+    for row in reader:
+        try:
+            name = row.get('Name', '').strip()
+            if not name:
+                continue
+            quantity = int(row.get('Count', row.get('Quantity', '1')))
+            set_code = row.get('Edition', row.get('Set', '')).strip().lower() or None
+            collector_num = str(row.get('Collector Number', row.get('Number', ''))).strip() or None
+            cards.append((name, quantity, set_code, collector_num))
+        except (ValueError, KeyError):
+            continue
+    
+    return cards
 
 
 def fetch_card_data(card_name: str) -> Optional[dict]:
-    """Fetch card data from Scryfall API."""
+    """Fetch card data from Scryfall API by fuzzy name."""
     url = f"{SCRYFALL_API}/cards/named"
     params = {"fuzzy": card_name}
     
     try:
         response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.HTTPError:
+        return None
+    except requests.exceptions.RequestException:
+        return None
+
+
+def fetch_card_by_set(set_code: str, collector_number: str) -> Optional[dict]:
+    """Fetch a specific card printing from Scryfall by set and collector number."""
+    url = f"{SCRYFALL_API}/cards/{set_code}/{collector_number}"
+    
+    try:
+        response = requests.get(url, timeout=10)
         response.raise_for_status()
         return response.json()
     except requests.exceptions.HTTPError:
@@ -100,9 +167,14 @@ def get_image_url(card_data: dict, size: str = 'large') -> Optional[str]:
     return None
 
 
-def download_image(url: str, card_name: str, use_cache: bool = True) -> Optional[Path]:
+def download_image(url: str, card_name: str, use_cache: bool = True,
+                    set_code: str = None, collector_number: str = None) -> Optional[Path]:
     """Download card image and return local path."""
-    filename = sanitize_filename(card_name) + ".png"
+    # Use set+collector for unique cache key when available (different art versions)
+    if set_code and collector_number:
+        filename = sanitize_filename(f"{card_name}_{set_code}_{collector_number}") + ".png"
+    else:
+        filename = sanitize_filename(card_name) + ".png"
     cache_path = CACHE_DIR / filename
     
     if use_cache and cache_path.exists():
@@ -246,7 +318,9 @@ class MTGProxyGUI:
         
         # Example text
         example_text = """# Example Decklist
-# Format: [qty]x Card Name
+# Supports plain & Moxfield formats:
+#   4x Lightning Bolt
+#   1 Sol Ring (MH3) 532
 
 4x Lightning Bolt
 4x Counterspell
@@ -261,6 +335,8 @@ class MTGProxyGUI:
         
         ttk.Button(btn_frame, text="Load File", 
                    command=self.load_decklist_file).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(btn_frame, text="Load Moxfield CSV", 
+                   command=self.load_moxfield_csv).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(btn_frame, text="Clear", 
                    command=self.clear_decklist).pack(side=tk.LEFT, padx=(0, 5))
         
@@ -343,11 +419,12 @@ class MTGProxyGUI:
         self.preview_canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
     
     def load_decklist_file(self):
-        """Load a decklist from a file."""
+        """Load a decklist from a file (plain text or Moxfield text export)."""
         filepath = filedialog.askopenfilename(
             title="Select Decklist File",
             filetypes=[
                 ("Text files", "*.txt"),
+                ("CSV files", "*.csv"),
                 ("All files", "*.*")
             ]
         )
@@ -356,11 +433,55 @@ class MTGProxyGUI:
             try:
                 with open(filepath, 'r', encoding='utf-8') as f:
                     content = f.read()
-                self.decklist_text.delete(1.0, tk.END)
-                self.decklist_text.insert(tk.END, content)
-                self.status_var.set(f"Loaded: {os.path.basename(filepath)}")
+                
+                # Auto-detect CSV (Moxfield CSV export)
+                if filepath.lower().endswith('.csv') or content.lstrip().startswith('Count,'):
+                    self._load_csv_content(content, filepath)
+                else:
+                    self.decklist_text.delete(1.0, tk.END)
+                    self.decklist_text.insert(tk.END, content)
+                    self.status_var.set(f"Loaded: {os.path.basename(filepath)}")
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to load file: {e}")
+    
+    def load_moxfield_csv(self):
+        """Load a Moxfield CSV export file."""
+        filepath = filedialog.askopenfilename(
+            title="Select Moxfield CSV Export",
+            filetypes=[
+                ("CSV files", "*.csv"),
+                ("All files", "*.*")
+            ]
+        )
+        
+        if filepath:
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                self._load_csv_content(content, filepath)
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to load CSV: {e}")
+    
+    def _load_csv_content(self, content: str, filepath: str):
+        """Parse CSV content and populate the decklist text area."""
+        cards = parse_moxfield_csv(content)
+        if not cards:
+            messagebox.showwarning("Empty", "No cards found in the CSV file.")
+            return
+        
+        # Convert to Moxfield-style text so the user can see/edit
+        lines = [f"# Imported from {os.path.basename(filepath)}\n"]
+        for name, qty, set_code, col_num in cards:
+            if set_code and col_num:
+                lines.append(f"{qty} {name} ({set_code.upper()}) {col_num}")
+            else:
+                lines.append(f"{qty}x {name}")
+        
+        self.decklist_text.delete(1.0, tk.END)
+        self.decklist_text.insert(tk.END, '\n'.join(lines))
+        self.status_var.set(
+            f"Loaded {len(cards)} unique cards from {os.path.basename(filepath)}"
+        )
     
     def clear_decklist(self):
         """Clear the decklist text area."""
@@ -379,15 +500,15 @@ class MTGProxyGUI:
         self.count_var.set("")
         self.progress_var.set(0)
     
-    def parse_decklist(self) -> List[Tuple[str, int]]:
-        """Parse the decklist text into card entries."""
+    def parse_decklist(self) -> List[Tuple[str, int, Optional[str], Optional[str]]]:
+        """Parse the decklist text into card entries with optional set info."""
         content = self.decklist_text.get(1.0, tk.END)
         cards = []
         
         for line in content.split('\n'):
-            name, qty = parse_card_entry(line)
+            name, qty, set_code, col_num = parse_card_entry(line)
             if name:
-                cards.append((name, qty))
+                cards.append((name, qty, set_code, col_num))
         
         return cards
     
@@ -408,45 +529,62 @@ class MTGProxyGUI:
         thread.daemon = True
         thread.start()
     
-    def fetch_cards_thread(self, card_entries: List[Tuple[str, int]]):
+    def fetch_cards_thread(self, card_entries: List[Tuple[str, int, Optional[str], Optional[str]]]):
         """Background thread for fetching cards."""
-        total_cards = sum(qty for _, qty in card_entries)
+        total_cards = sum(qty for _, qty, *_ in card_entries)
         fetched = 0
         errors = []
         
-        for card_name, quantity in card_entries:
+        for entry in card_entries:
+            card_name, quantity = entry[0], entry[1]
+            set_code = entry[2] if len(entry) > 2 else None
+            collector_num = entry[3] if len(entry) > 3 else None
+            
             # Update status
-            self.root.after(0, lambda n=card_name: 
+            display = card_name
+            if set_code and collector_num:
+                display = f"{card_name} ({set_code.upper()}) #{collector_num}"
+            self.root.after(0, lambda n=display: 
                            self.status_var.set(f"Fetching: {n}..."))
             
             # Respect Scryfall rate limit
             time.sleep(0.1)
             
-            card_data = fetch_card_data(card_name)
+            # Try specific printing first, fall back to fuzzy name
+            card_data = None
+            if set_code and collector_num:
+                card_data = fetch_card_by_set(set_code, collector_num)
+            if not card_data:
+                card_data = fetch_card_data(card_name)
+            
             if not card_data:
                 errors.append(card_name)
                 fetched += quantity
-                self.root.after(0, lambda: 
-                               self.progress_var.set((fetched / total_cards) * 100))
+                self.root.after(0, lambda f=fetched: 
+                               self.progress_var.set((f / total_cards) * 100))
                 continue
             
             actual_name = card_data.get('name', card_name)
+            actual_set = card_data.get('set', set_code)
+            actual_num = card_data.get('collector_number', collector_num)
             
             # Get large image for PDF
             image_url_large = get_image_url(card_data, 'large')
             if not image_url_large:
                 errors.append(card_name)
                 fetched += quantity
-                self.root.after(0, lambda: 
-                               self.progress_var.set((fetched / total_cards) * 100))
+                self.root.after(0, lambda f=fetched: 
+                               self.progress_var.set((f / total_cards) * 100))
                 continue
             
-            image_path = download_image(image_url_large, actual_name)
+            image_path = download_image(image_url_large, actual_name,
+                                         set_code=actual_set,
+                                         collector_number=actual_num)
             if not image_path:
                 errors.append(card_name)
                 fetched += quantity
-                self.root.after(0, lambda: 
-                               self.progress_var.set((fetched / total_cards) * 100))
+                self.root.after(0, lambda f=fetched: 
+                               self.progress_var.set((f / total_cards) * 100))
                 continue
             
             # Create resized image for PDF
@@ -457,12 +595,17 @@ class MTGProxyGUI:
             preview_img.thumbnail((PREVIEW_CARD_WIDTH, PREVIEW_CARD_HEIGHT), 
                                    Image.Resampling.LANCZOS)
             
+            # Build display label
+            label = actual_name
+            if actual_set:
+                label = f"{actual_name} [{actual_set.upper()}]"
+            
             # Add cards for quantity
             for i in range(quantity):
                 self.card_images.append((actual_name, pdf_image))
                 
                 # Add to preview (in main thread)
-                self.root.after(0, lambda img=preview_img.copy(), name=actual_name: 
+                self.root.after(0, lambda img=preview_img.copy(), name=label: 
                                self.add_preview_card(img, name))
                 
                 fetched += 1
